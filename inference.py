@@ -429,11 +429,15 @@ def run_episode(client, task, seed=SEED):
         reset_data = env_request("POST", "/reset", params={"task": task, "seed": seed})
         if reset_data is None:
             reset_data = env_request("POST", "/reset", params={"task": task})
-        if reset_data is None:
-            print("  ERROR: Failed to reset")
+        if reset_data is None or not isinstance(reset_data, dict):
+            print("  ERROR: Failed to reset or received invalid response")
             return 0.0
 
         obs = reset_data.get("observation", reset_data)
+        if not isinstance(obs, dict):
+            print("  ERROR: Invalid observation format")
+            return 0.0
+        
         cache = {}
         history = []
         invalid_streak = 0
@@ -530,10 +534,15 @@ def run_episode(client, task, seed=SEED):
             if result is None:
                 result = env_request("POST", "/step",
                     json={"action": {"type": "submit", "verdict": "reject", "summary": "env_error"}})
-                if result is None:
+                if result is None or not isinstance(result, dict):
+                    print("  ERROR: Step request failed")
                     return 0.0
 
             obs = result.get("observation", result)
+            if not isinstance(obs, dict):
+                print("  ERROR: Invalid observation in step response")
+                return 0.0
+            
             reward = result.get("reward", 0.0)
             done = result.get("done", False)
             error_str = obs.get("last_action_error") or "null"
@@ -577,17 +586,23 @@ def run_episode(client, task, seed=SEED):
                 pending_compare_overrides.append(_hint_to_compare_action(compare_hint))
 
             if done:
-                final_score = float(result.get("info", {}).get("score", 0.0))
+                try:
+                    final_score = float(result.get("info", {}).get("score", 0.0)) if isinstance(result, dict) else 0.0
+                except (ValueError, TypeError, AttributeError):
+                    final_score = 0.0
                 print(f"  Done. Score: {final_score:.4f}")
                 return final_score
 
         print("  Max steps; forcing submit")
         em = env_request("POST", "/step",
             json={"action": {"type": "submit", "verdict": "pass", "summary": "max_steps"}})
-        if em:
-            final_score = float(em.get("info", {}).get("score", 0.0))
-            total_steps += 1
-            step_rewards.append(em.get("reward", 0.0))
+        if em and isinstance(em, dict):
+            try:
+                final_score = float(em.get("info", {}).get("score", 0.0))
+                total_steps += 1
+                step_rewards.append(em.get("reward", 0.0))
+            except (ValueError, TypeError, AttributeError):
+                final_score = 0.0
         return final_score
 
     finally:
@@ -605,81 +620,101 @@ def run_episode(client, task, seed=SEED):
 # -- Main --------------------------------------------------------------------
 
 def main():
-    print("=" * 60)
-    print("  ML Experiment Integrity Auditor - Baseline v4.0")
-    print("=" * 60)
-
-    missing = []
-    if not API_BASE_URL: missing.append("API_BASE_URL")
-    if not MODEL_NAME:   missing.append("MODEL_NAME")
-    if not API_KEY:      missing.append("HF_TOKEN or OPENAI_API_KEY")
-    if missing:
-        print(f"ERROR: Missing: {', '.join(missing)}"); sys.exit(1)
-
-    masked = API_KEY[:8] + "***" + API_KEY[-4:] if len(API_KEY) > 12 else "???"
-    print(f"  API_BASE_URL = {API_BASE_URL}")
-    print(f"  MODEL_NAME   = {MODEL_NAME}")
-    print(f"  API_KEY      = {masked}")
-    print(f"  ENV_URL      = {ENV_URL}")
-    print()
-
-    health = env_request("GET", "/health")
-    if health is None:
-        print(f"ERROR: Cannot reach {ENV_URL}"); sys.exit(1)
-    print(f"Environment: {health}")
-
-    client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-
-    print("Testing LLM...")
     try:
-        test_resp = llm_call(client, [{"role": "user", "content": 'Say "OK"'}])
-        print(f"  OK: {(test_resp or '').strip()[:20]}")
-    except Exception as exc:
-        print(f"  LLM test failed: {str(exc)[:120]}")
-        print("  Continuing anyway...")
-    print()
+        print("=" * 60)
+        print("  ML Experiment Integrity Auditor - Baseline v4.0")
+        print("=" * 60)
 
-    start = time.time()
-    tasks = ["easy", "medium", "hard"]
-    if TASK_FILTER:
-        if TASK_FILTER not in tasks:
-            print(f"ERROR: Invalid TASK_FILTER='{TASK_FILTER}'. Use easy|medium|hard"); sys.exit(1)
-        tasks = [TASK_FILTER]
+        missing = []
+        if not API_BASE_URL: missing.append("API_BASE_URL")
+        if not MODEL_NAME:   missing.append("MODEL_NAME")
+        if not API_KEY:      missing.append("HF_TOKEN or OPENAI_API_KEY")
+        if missing:
+            print(f"ERROR: Missing: {', '.join(missing)}"); sys.exit(1)
 
-    scores = {}
-    for task in tasks:
-        print("-" * 60)
-        print(f"  Task: {task.upper()} (episodes={MAX_EPISODES}, seed_base={SEED})")
-        print("-" * 60)
-        try:
-            task_scores = []
-            for episode_idx in range(MAX_EPISODES):
-                episode_seed = SEED + episode_idx
-                print(f"  Episode {episode_idx + 1}/{MAX_EPISODES} (seed={episode_seed})")
-                task_scores.append(run_episode(client, task, episode_seed))
-            scores[task] = sum(task_scores) / len(task_scores) if task_scores else 0.0
-        except Exception as exc:
-            print(f"  ERROR: {exc}"); scores[task] = 0.0
+        masked = API_KEY[:8] + "***" + API_KEY[-4:] if len(API_KEY) > 12 else "???"
+        print(f"  API_BASE_URL = {API_BASE_URL}")
+        print(f"  MODEL_NAME   = {MODEL_NAME}")
+        print(f"  API_KEY      = {masked}")
+        print(f"  ENV_URL      = {ENV_URL}")
         print()
 
-    elapsed = time.time() - start
-    avg = sum(scores.values()) / len(scores) if scores else 0.0
-    summary = {
-        "easy": round(scores.get("easy", 0.0), 4),
-        "medium": round(scores.get("medium", 0.0), 4),
-        "hard": round(scores.get("hard", 0.0), 4),
-        "average": round(avg, 4),
-        "runtime_seconds": round(elapsed, 1),
-    }
-    print("=" * 60)
-    print(f"easy:    {summary['easy']:.4f}")
-    print(f"medium:  {summary['medium']:.4f}")
-    print(f"hard:    {summary['hard']:.4f}")
-    print(f"average: {summary['average']:.4f}")
-    print(f"runtime: {summary['runtime_seconds']:.1f}s")
-    print("=" * 60)
-    print(json.dumps(summary))
+        health = env_request("GET", "/health")
+        if health is None:
+            print(f"ERROR: Cannot reach {ENV_URL}"); sys.exit(1)
+        print(f"Environment: {health}")
+
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+
+        print("Testing LLM...")
+        try:
+            test_resp = llm_call(client, [{"role": "user", "content": 'Say "OK"'}])
+            print(f"  OK: {(test_resp or '').strip()[:20]}")
+        except Exception as exc:
+            print(f"  LLM test failed: {str(exc)[:120]}")
+            print("  Continuing anyway...")
+        print()
+
+        start = time.time()
+        tasks = ["easy", "medium", "hard"]
+        if TASK_FILTER:
+            if TASK_FILTER not in tasks:
+                print(f"ERROR: Invalid TASK_FILTER='{TASK_FILTER}'. Use easy|medium|hard"); sys.exit(1)
+            tasks = [TASK_FILTER]
+
+        scores = {}
+        for task in tasks:
+            print("-" * 60)
+            print(f"  Task: {task.upper()} (episodes={MAX_EPISODES}, seed_base={SEED})")
+            print("-" * 60)
+            try:
+                task_scores = []
+                for episode_idx in range(MAX_EPISODES):
+                    episode_seed = SEED + episode_idx
+                    print(f"  Episode {episode_idx + 1}/{MAX_EPISODES} (seed={episode_seed})")
+                    task_scores.append(run_episode(client, task, episode_seed))
+                scores[task] = sum(task_scores) / len(task_scores) if task_scores else 0.0
+            except Exception as exc:
+                print(f"  ERROR: {exc}"); scores[task] = 0.0
+            print()
+
+        elapsed = time.time() - start
+        avg = sum(scores.values()) / len(scores) if scores else 0.0
+        summary = {
+            "easy": round(scores.get("easy", 0.0), 4),
+            "medium": round(scores.get("medium", 0.0), 4),
+            "hard": round(scores.get("hard", 0.0), 4),
+            "average": round(avg, 4),
+            "runtime_seconds": round(elapsed, 1),
+        }
+        print("=" * 60)
+        print(f"easy:    {summary['easy']:.4f}")
+        print(f"medium:  {summary['medium']:.4f}")
+        print(f"hard:    {summary['hard']:.4f}")
+        print(f"average: {summary['average']:.4f}")
+        print(f"runtime: {summary['runtime_seconds']:.1f}s")
+        print("=" * 60)
+        print(json.dumps(summary))
+    
+    except SystemExit:
+        # Allow sys.exit() calls to propagate
+        raise
+    except Exception as exc:
+        # Catch any unhandled exceptions and exit gracefully
+        print(f"\n[ERROR] Unhandled exception: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Script interrupted by user", file=sys.stderr)
+        sys.exit(130)
+    except Exception as exc:
+        print(f"\n[FATAL] Script crashed: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
