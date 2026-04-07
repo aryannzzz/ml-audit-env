@@ -20,12 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source code
 COPY environment/ ./environment/
-COPY experiments/ ./experiments/
 COPY tests/ ./tests/
 COPY app.py .
 COPY inference.py .
 COPY openenv.yaml .
-COPY croissant.json .
 COPY README.md .
 
 # Create non-root runtime user for security

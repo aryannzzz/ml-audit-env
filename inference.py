@@ -26,7 +26,7 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
 API_BASE_URL = (
     os.environ.get("API_BASE_URL")
     or os.environ.get("OPENAI_BASE_URL")
-    or ""
+    or "https://router.huggingface.co/v1"
 ).strip().strip('"').strip("'")
 
 # Prioritize OPENAI_API_KEY when using OpenAI API
@@ -45,7 +45,7 @@ else:
         or ""
     ).strip().strip('"').strip("'")
 
-MODEL_NAME = (os.environ.get("MODEL_NAME") or "").strip().strip('"').strip("'")
+MODEL_NAME = (os.environ.get("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct").strip().strip('"').strip("'")
 
 ENV_URL = (
     os.environ.get("ENV_URL") or "http://localhost:7860"
