@@ -420,6 +420,7 @@ def run_episode(client, task, seed=SEED):
     step_rewards = []
     final_score = 0.0
     total_steps = 0
+    response_text = ""  # ensure always defined
 
     # [START] line - emitted at episode begin
     print(f"[START] task={task} env=ml-audit-bench model={MODEL_NAME}", flush=True)
@@ -459,6 +460,7 @@ def run_episode(client, task, seed=SEED):
             messages.append({"role": "user", "content": ctx})
 
             # DRY_RUN mode: skip LLM, use deterministic actions
+            response_text = ""
             if DRY_RUN:
                 action = get_dry_run_action(obs, step_num)
             else:
@@ -630,7 +632,9 @@ def main():
         if not MODEL_NAME:   missing.append("MODEL_NAME")
         if not API_KEY:      missing.append("HF_TOKEN or OPENAI_API_KEY")
         if missing:
-            print(f"ERROR: Missing: {', '.join(missing)}"); sys.exit(1)
+            print(f"ERROR: Missing required env vars: {', '.join(missing)}")
+            print("Set API_BASE_URL, MODEL_NAME, and HF_TOKEN before running.")
+            sys.exit(1)
 
         masked = API_KEY[:8] + "***" + API_KEY[-4:] if len(API_KEY) > 12 else "???"
         print(f"  API_BASE_URL = {API_BASE_URL}")
@@ -641,7 +645,9 @@ def main():
 
         health = env_request("GET", "/health")
         if health is None:
-            print(f"ERROR: Cannot reach {ENV_URL}"); sys.exit(1)
+            print(f"ERROR: Cannot reach environment at {ENV_URL}/health")
+            print("Make sure the Docker container is running on port 7860.")
+            sys.exit(1)
         print(f"Environment: {health}")
 
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
