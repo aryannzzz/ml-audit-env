@@ -13,7 +13,7 @@ import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import requests
@@ -55,7 +55,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 # Mandatory defaults per competition specification
-API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+API_BASE_URL = os.getenv("OPENAI_BASE_URL") or os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
 MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY") or ""
 ENV_URL = os.getenv("ENV_URL") or "http://localhost:7860"
@@ -64,18 +64,46 @@ BENCHMARK = "ml-audit-bench"
 SEED = _env_int("SEED", 42)
 MAX_STEPS = _env_int("MAX_STEPS", 18)
 MAX_EPISODES = _env_int("MAX_EPISODES", 1)
-MAX_TOKENS = _env_int("MAX_TOKENS", 500)
+MAX_TOKENS = _env_int("MAX_TOKENS", 600)
 TEMPERATURE = _env_float("TEMPERATURE", 0.0)
-REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 8)
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 30)
 TASK_FILTER = (os.getenv("TASK_FILTER") or "").strip().lower()
 DRY_RUN = (os.getenv("DRY_RUN") or "0").strip() == "1"
 RETRY_DELAYS = [0.5, 1.0, 2.0]
+ENFORCE_COMPARE = (os.getenv("ENFORCE_COMPARE") or "0").strip() == "1"
 
-SYSTEM_PROMPT = (
-    "You are an ML integrity auditor. Return exactly one JSON action object. "
-    "Valid actions: inspect, compare, flag, unflag, submit. "
-    "Do not return prose or markdown."
-)
+SYSTEM_PROMPT = """
+You are an ML experiment auditor. Find violations in ML experiments.
+
+VIOLATIONS (8 types):
+- V1 Preprocessing Leakage: fit_transform/fit on ALL data BEFORE split.
+- V2 Temporal Shuffle: time-series shuffled before split.
+- V3 Target Leakage: target column in feature_columns.
+- V4 Train/Test Overlap: same sample IDs in train and test.
+- V5 Cherry-Picking: multiple runs, only best reported undisclosed.
+- V6 Metric Shopping: multiple metrics tracked, only best reported.
+- V7 Entity Leakage: same entities in train and test.
+- V8 Multi-Test Leakage: test set used for tuning and final evaluation.
+
+Look in these artifacts:
+- preprocessing for V1
+- split_config + dataset_info for V2, V4, V7
+- model_config + dataset_info for V3
+- run_history + experiment_notes for V5
+- validation_strategy + eval_report for V6/V8
+
+ACTIONS (JSON only):
+{"type":"inspect","artifact":"NAME"}
+{"type":"compare","artifact_a":"NAME","artifact_b":"NAME"}
+{"type":"flag","violation_type":"V1|V2|V3|V4|V5|V6|V7|V8","evidence_artifact":"NAME","evidence_quote":"EXACT TEXT","severity":"high|medium|low"}
+{"type":"submit","verdict":"pass|revise|reject","summary":"why"}
+
+CRITICAL RULES:
+1) Inspect before flag.
+2) evidence_quote must be exact character-for-character from inspected artifact.
+3) Output one JSON action only. No prose or markdown.
+4) Verdict guidance: reject (V1-V4, V7-V8), revise (V5-V6), pass (clean).
+""".strip()
 
 ACTION_PRIORITY = [
     "dataset_info",
@@ -86,6 +114,17 @@ ACTION_PRIORITY = [
     "eval_report",
     "run_history",
     "experiment_notes",
+    "training_logs",
+    "feature_engineering",
+]
+
+FALLBACK_ACTIONS = [
+    {"type": "inspect", "artifact": "dataset_info"},
+    {"type": "inspect", "artifact": "preprocessing"},
+    {"type": "inspect", "artifact": "split_config"},
+    {"type": "inspect", "artifact": "model_config"},
+    {"type": "compare", "artifact_a": "validation_strategy", "artifact_b": "eval_report"},
+    {"type": "submit", "verdict": "pass", "summary": "No clear violations found (fallback mode)"},
 ]
 
 
@@ -101,6 +140,175 @@ def _one_line(value: Any) -> str:
         return "null"
     text = str(value).replace("\r", " ").replace("\n", " ").strip()
     return text if text else "null"
+
+
+def _truncate_text(value: Any, limit: int = 800) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=True)
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 14)] + "...<truncated>"
+
+
+def _resolve_api_base_url(api_base_url: str, api_key: str) -> str:
+    base = (api_base_url or "").strip()
+    key = (api_key or "").strip()
+
+    if not base:
+        return "https://router.huggingface.co/v1"
+
+    # Guard against common misconfiguration: HF token sent to OpenAI endpoint.
+    if "api.openai.com" in base and key.startswith("hf_"):
+        print(
+            "Detected HF token with OpenAI base URL; switching to HF router endpoint.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return "https://router.huggingface.co/v1"
+
+    return base
+
+
+def _canonical_compare_pair(artifact_a: str, artifact_b: str) -> Tuple[str, str]:
+    a = str(artifact_a)
+    b = str(artifact_b)
+    return (a, b) if a <= b else (b, a)
+
+
+def _summarize_flags(flags: Any) -> List[Dict[str, str]]:
+    if not isinstance(flags, list):
+        return []
+
+    summaries: List[Dict[str, str]] = []
+    for flag in flags:
+        if not isinstance(flag, dict):
+            continue
+        summaries.append(
+            {
+                "flag_id": str(flag.get("flag_id", "")),
+                "violation_type": str(flag.get("violation_type", "")),
+                "evidence_artifact": str(flag.get("evidence_artifact", "")),
+                "evidence_quote": _truncate_text(flag.get("evidence_quote", ""), 220),
+            }
+        )
+    return summaries
+
+
+def _extract_compare_sections(result_text: str) -> Dict[str, str]:
+    text = (result_text or "").strip()
+    if not text:
+        return {}
+
+    sections: Dict[str, str] = {}
+    markers = list(re.finditer(r"===\s*([A-Za-z0-9_]+)\s*===\n", text))
+    if not markers:
+        return sections
+
+    for idx, marker in enumerate(markers):
+        artifact = marker.group(1).strip()
+        content_start = marker.end()
+        content_end = markers[idx + 1].start() if idx + 1 < len(markers) else len(text)
+        sections[artifact] = text[content_start:content_end].strip()
+
+    return sections
+
+
+def _update_artifact_cache(action: Dict[str, Any], observation: Dict[str, Any], artifact_cache: Dict[str, str]) -> None:
+    if observation.get("last_action_error"):
+        return
+
+    result_text = observation.get("last_action_result")
+    if not isinstance(result_text, str) or not result_text.strip():
+        return
+
+    action_type = str(action.get("type", "")).strip().lower()
+    if action_type == "inspect":
+        artifact = action.get("artifact")
+        if artifact:
+            artifact_cache[str(artifact)] = result_text
+        return
+
+    if action_type == "compare":
+        artifact_a = str(action.get("artifact_a", ""))
+        artifact_b = str(action.get("artifact_b", ""))
+        sections = _extract_compare_sections(result_text)
+
+        if sections:
+            for artifact, content in sections.items():
+                artifact_cache[str(artifact)] = content
+            return
+
+        # Fallback if compare text does not include section markers.
+        if artifact_a:
+            artifact_cache[artifact_a] = result_text
+        if artifact_b:
+            artifact_cache[artifact_b] = result_text
+
+
+def _required_compare_action(
+    observation: Dict[str, Any],
+    called_compares: Set[Tuple[str, str]],
+    step_index: int,
+    budget: int,
+) -> Optional[Dict[str, str]]:
+    if (step_index + 1) <= (budget / 2):
+        return None
+
+    inspected = {str(a) for a in (observation.get("inspected_artifacts") or [])}
+    available = {str(a) for a in (observation.get("available_artifacts") or [])}
+
+    required_pairs = [
+        ("run_history", "experiment_notes"),
+        ("validation_strategy", "eval_report"),
+    ]
+    for artifact_a, artifact_b in required_pairs:
+        pair = _canonical_compare_pair(artifact_a, artifact_b)
+        if (
+            artifact_a in inspected
+            and artifact_b in inspected
+            and artifact_a in available
+            and artifact_b in available
+            and pair not in called_compares
+        ):
+            return {"type": "compare", "artifact_a": artifact_a, "artifact_b": artifact_b}
+
+    return None
+
+
+def _recent_repeated_inspect_artifact(last_actions: List[Tuple[str, str]], n: int = 3) -> Optional[str]:
+    if len(last_actions) < n:
+        return None
+
+    recent = last_actions[-n:]
+    first_type, first_artifact = recent[0]
+    if first_type != "inspect" or not first_artifact:
+        return None
+
+    if all(action_type == "inspect" and artifact == first_artifact for action_type, artifact in recent):
+        return first_artifact
+
+    return None
+
+
+def _loop_break_action(observation: Dict[str, Any], repeated_artifact: str) -> Dict[str, str]:
+    available = [str(a) for a in (observation.get("available_artifacts") or [])]
+    inspected = {str(a) for a in (observation.get("inspected_artifacts") or [])}
+
+    for artifact in ACTION_PRIORITY:
+        if artifact in available and artifact not in inspected and artifact != repeated_artifact:
+            return {"type": "inspect", "artifact": artifact}
+
+    for artifact in available:
+        if artifact not in inspected and artifact != repeated_artifact:
+            return {"type": "inspect", "artifact": artifact}
+
+    return {
+        "type": "submit",
+        "verdict": "reject",
+        "summary": "Loop guard triggered: all artifacts already inspected",
+    }
 
 
 def _http_request(
@@ -170,6 +378,16 @@ def _parse_action(response_text: str) -> Optional[Dict[str, Any]]:
                 return parsed
         except json.JSONDecodeError:
             continue
+
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(raw[start:end])
+            if isinstance(parsed, dict) and "type" in parsed:
+                return parsed
+        except json.JSONDecodeError:
+            pass
 
     return None
 
@@ -248,24 +466,51 @@ def _normalize_action(action: Dict[str, Any], observation: Dict[str, Any], step_
     return _fallback_action(observation, step_index, budget)
 
 
-def _build_messages(observation: Dict[str, Any], step_index: int, budget: int) -> List[Dict[str, str]]:
+def _build_messages(
+    observation: Dict[str, Any],
+    step_index: int,
+    budget: int,
+    artifact_cache: Dict[str, str],
+    called_compares: Set[Tuple[str, str]],
+    history: List[Tuple[str, str]],
+) -> List[Dict[str, str]]:
+    ordered_cache: Dict[str, str] = {}
+    inspected_artifacts = [str(a) for a in (observation.get("inspected_artifacts") or [])]
+    for artifact in inspected_artifacts[-4:]:
+        if artifact in artifact_cache:
+            ordered_cache[artifact] = _truncate_text(artifact_cache[artifact], 500)
+
+    last_content = _truncate_text(observation.get("last_action_result", ""), 1200)
     content = {
         "step": step_index + 1,
         "budget": budget,
+        "steps_remaining": max(0, budget - (step_index + 1)),
+        "task_description": observation.get("task_description") or "",
+        "goal": observation.get("goal") or "",
+        "dataset_type": observation.get("dataset_type") or "unknown",
         "available_artifacts": observation.get("available_artifacts", []),
         "inspected_artifacts": observation.get("inspected_artifacts", []),
-        "flags_raised": observation.get("flags_raised", []),
-        "last_action_result": observation.get("last_action_result", ""),
+        "flags_raised": _summarize_flags(observation.get("flags_raised", [])),
+        "compares_already_called": [f"{a}<->{b}" for a, b in sorted(called_compares)],
+        "inspected_artifact_cache": ordered_cache,
+        "last_artifact_content_returned": last_content,
         "last_action_error": observation.get("last_action_error") or "none",
     }
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+    messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for user_msg, assistant_msg in history[-2:]:
+        messages.append({"role": "user", "content": user_msg})
+        messages.append({"role": "assistant", "content": assistant_msg})
+
+    messages.append(
         {
             "role": "user",
-            "content": "Choose the next action as one JSON object only. Current state:\n"
+            "content": "Choose the next action as one JSON object only. "
+            "Interpret last_artifact_content_returned as the exact content returned by the most recent inspect/compare call. "
+            "Current state:\n"
             + json.dumps(content, ensure_ascii=True),
-        },
-    ]
+        }
+    )
+    return messages
 
 
 def _llm_call(client: Any, messages: List[Dict[str, str]]) -> str:
@@ -279,6 +524,7 @@ def _llm_call(client: Any, messages: List[Dict[str, str]]) -> str:
                 temperature=TEMPERATURE,
                 max_tokens=MAX_TOKENS,
                 stream=False,
+                timeout=REQUEST_TIMEOUT,
             )
             return (completion.choices[0].message.content or "").strip()
         except Exception as exc:
@@ -294,11 +540,20 @@ def run_episode(client: Any, task: str, seed: int = 42) -> float:
     final_score = 0.0
     total_steps = 0
     response_text = ""
+    artifact_cache: Dict[str, str] = {}
+    last_actions: List[Tuple[str, str]] = []
+    called_compares: Set[Tuple[str, str]] = set()
+    dialog_history: List[Tuple[str, str]] = []
+    consecutive_failures = 0
+    fallback_index = 0
 
     print(f"[START] task={task} env={BENCHMARK} model={MODEL_NAME}", flush=True)
 
     try:
         reset_data = _http_request("POST", "/reset", params={"task": task, "seed": seed})
+        if reset_data is None:
+            # Backward-compatible fallback for environments that do not accept seed.
+            reset_data = _http_request("POST", "/reset", params={"task": task})
         if reset_data is None:
             return 0.0
 
@@ -319,15 +574,49 @@ def run_episode(client: Any, task: str, seed: int = 42) -> float:
 
         for step_index in range(budget):
             response_text = ""
-            if DRY_RUN:
+            llm_messages: List[Dict[str, str]] = []
+            forced_compare = _required_compare_action(observation, called_compares, step_index, budget) if ENFORCE_COMPARE else None
+            if forced_compare is not None:
+                action = forced_compare
+            elif DRY_RUN:
                 action = _fallback_action(observation, step_index, budget)
             else:
-                messages = _build_messages(observation, step_index, budget)
-                response_text = _llm_call(client, messages)
+                llm_messages = _build_messages(
+                    observation,
+                    step_index,
+                    budget,
+                    artifact_cache,
+                    called_compares,
+                    dialog_history,
+                )
+                response_text = _llm_call(client, llm_messages)
                 parsed = _parse_action(response_text)
-                action = parsed if parsed is not None else _fallback_action(observation, step_index, budget)
+                if parsed is not None:
+                    consecutive_failures = 0
+                    action = parsed
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3 and fallback_index < len(FALLBACK_ACTIONS):
+                        action = dict(FALLBACK_ACTIONS[fallback_index])
+                        fallback_index += 1
+                    else:
+                        action = _fallback_action(observation, step_index, budget)
+
+                user_msg = llm_messages[-1]["content"] if llm_messages else ""
+                assistant_msg = response_text.strip() or json.dumps(action, ensure_ascii=True)
+                dialog_history.append((user_msg, assistant_msg))
+                if len(dialog_history) > 6:
+                    dialog_history = dialog_history[-6:]
 
             action = _normalize_action(action, observation, step_index, budget)
+
+            repeated_artifact = _recent_repeated_inspect_artifact(last_actions, n=3)
+            if (
+                repeated_artifact is not None
+                and action.get("type") == "inspect"
+                and str(action.get("artifact", "")) == repeated_artifact
+            ):
+                action = _loop_break_action(observation, repeated_artifact)
 
             result = _http_request("POST", "/step", json_body={"action": action})
             if result is None:
@@ -346,6 +635,31 @@ def run_episode(client: Any, task: str, seed: int = 42) -> float:
 
             total_steps = step_index + 1
             step_rewards.append(reward)
+
+            _update_artifact_cache(action, observation, artifact_cache)
+
+            action_type = str(action.get("type", "")).strip().lower()
+            if action_type == "compare":
+                artifact_a = str(action.get("artifact_a", "")).strip()
+                artifact_b = str(action.get("artifact_b", "")).strip()
+                if artifact_a and artifact_b:
+                    called_compares.add(_canonical_compare_pair(artifact_a, artifact_b))
+
+            if action_type == "inspect":
+                last_actions.append(("inspect", str(action.get("artifact", ""))))
+            elif action_type == "compare":
+                pair_label = f"{action.get('artifact_a', '')}|{action.get('artifact_b', '')}"
+                last_actions.append(("compare", pair_label))
+            elif action_type == "flag":
+                last_actions.append(("flag", str(action.get("violation_type", ""))))
+            elif action_type == "submit":
+                last_actions.append(("submit", str(action.get("verdict", ""))))
+            else:
+                last_actions.append((action_type, ""))
+
+            if len(last_actions) > 12:
+                last_actions = last_actions[-12:]
+
             action_str = json.dumps(action, separators=(",", ":"), ensure_ascii=True)
             print(
                 f"[STEP] step={total_steps} action={action_str} reward={reward:.2f} "
@@ -428,13 +742,15 @@ def _resolve_tasks() -> List[str]:
 def main() -> int:
     print("Starting ML Audit inference...", file=sys.stderr, flush=True)
 
+    resolved_api_base_url = _resolve_api_base_url(API_BASE_URL, API_KEY)
+
     client: Any = None
     if OpenAI is None:
         if OPENAI_IMPORT_ERROR is not None:
             print(f"WARN: OpenAI import unavailable: {OPENAI_IMPORT_ERROR}", file=sys.stderr, flush=True)
     elif not DRY_RUN and API_KEY:
         try:
-            client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+            client = OpenAI(base_url=resolved_api_base_url, api_key=API_KEY)
         except Exception as exc:
             print(f"Failed to initialize OpenAI client: {exc}", file=sys.stderr, flush=True)
             client = None

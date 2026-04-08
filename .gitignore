@@ -13,3 +13,9 @@ build/
 .env.*
 .env.local
 .env.*.local
+
+# Local diagnostics and alternate inference drafts
+HF_MODEL_SMOKE_TEST.md
+INFERENCE_FIXES.md
+inference_original.py
+inference_working.py
