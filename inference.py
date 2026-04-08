@@ -127,12 +127,40 @@ FALLBACK_ACTIONS = [
     {"type": "submit", "verdict": "pass", "summary": "No clear violations found (fallback mode)"},
 ]
 
+# Compare hints used for pre-LLM nudges and unit-test helper coverage.
+COMPARE_HINTS: Dict[str, Dict[str, Any]] = {
+    "V5": {
+        "requires": {"run_history", "experiment_notes"},
+        "message": "V5 check ready: compare run_history vs experiment_notes for cherry-picking disclosure mismatch.",
+    },
+    "V6": {
+        "requires": {"validation_strategy", "eval_report"},
+        "message": "V6 check ready: compare validation_strategy vs eval_report for metric-shopping mismatch.",
+    },
+}
+
 
 def _to_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def maybe_add_compare_hint(
+    inspected_set: set[str],
+    compare_hints: Dict[str, Dict[str, Any]],
+    already_hinted: set[str],
+) -> Optional[str]:
+    """Return one compare hint when prerequisites are met, at most once per violation key."""
+    for violation_key, hint in compare_hints.items():
+        if violation_key in already_hinted:
+            continue
+        required = set(hint.get("requires", set()))
+        if required and required.issubset(inspected_set):
+            already_hinted.add(violation_key)
+            return str(hint.get("message", ""))
+    return None
 
 
 def _one_line(value: Any) -> str:
