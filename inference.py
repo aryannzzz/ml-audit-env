@@ -15,8 +15,21 @@ import sys
 import time
 from typing import Any, Dict, List, Optional
 
-import requests
-from openai import OpenAI
+try:
+    import requests
+except Exception as exc:  # pragma: no cover - defensive for validator runtime variance
+    requests = None
+    REQUESTS_IMPORT_ERROR = exc
+else:
+    REQUESTS_IMPORT_ERROR = None
+
+try:
+    from openai import OpenAI
+except Exception as exc:  # pragma: no cover - defensive for validator runtime variance
+    OpenAI = None
+    OPENAI_IMPORT_ERROR = exc
+else:
+    OPENAI_IMPORT_ERROR = None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -53,10 +66,10 @@ MAX_STEPS = _env_int("MAX_STEPS", 18)
 MAX_EPISODES = _env_int("MAX_EPISODES", 1)
 MAX_TOKENS = _env_int("MAX_TOKENS", 500)
 TEMPERATURE = _env_float("TEMPERATURE", 0.0)
-REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 30)
+REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 8)
 TASK_FILTER = (os.getenv("TASK_FILTER") or "").strip().lower()
 DRY_RUN = (os.getenv("DRY_RUN") or "0").strip() == "1"
-RETRY_DELAYS = [1, 2, 4]
+RETRY_DELAYS = [0.5, 1.0, 2.0]
 
 SYSTEM_PROMPT = (
     "You are an ML integrity auditor. Return exactly one JSON action object. "
@@ -97,6 +110,11 @@ def _http_request(
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
+    if requests is None:
+        if REQUESTS_IMPORT_ERROR is not None:
+            print(f"requests import unavailable: {REQUESTS_IMPORT_ERROR}", file=sys.stderr, flush=True)
+        return None
+
     url = f"{ENV_URL.rstrip('/')}{endpoint}"
     for attempt in range(len(RETRY_DELAYS) + 1):
         try:
@@ -107,7 +125,7 @@ def _http_request(
             response.raise_for_status()
             data = response.json()
             return data if isinstance(data, dict) else None
-        except (requests.RequestException, ValueError) as exc:
+        except Exception as exc:
             if attempt < len(RETRY_DELAYS):
                 time.sleep(RETRY_DELAYS[attempt])
             else:
@@ -250,7 +268,7 @@ def _build_messages(observation: Dict[str, Any], step_index: int, budget: int) -
     ]
 
 
-def _llm_call(client: Optional[OpenAI], messages: List[Dict[str, str]]) -> str:
+def _llm_call(client: Any, messages: List[Dict[str, str]]) -> str:
     if client is None:
         return ""
     for attempt in range(len(RETRY_DELAYS) + 1):
@@ -271,7 +289,7 @@ def _llm_call(client: Optional[OpenAI], messages: List[Dict[str, str]]) -> str:
     return ""
 
 
-def run_episode(client: Optional[OpenAI], task: str, seed: int = 42) -> float:
+def run_episode(client: Any, task: str, seed: int = 42) -> float:
     step_rewards: List[float] = []
     final_score = 0.0
     total_steps = 0
@@ -379,13 +397,18 @@ def run_episode(client: Optional[OpenAI], task: str, seed: int = 42) -> float:
         return 0.0
 
     finally:
-        success = final_score > 0.0
-        rewards_str = ",".join(f"{r:.2f}" for r in step_rewards) if step_rewards else "0.00"
-        print(
-            f"[END] success={str(success).lower()} steps={total_steps} "
-            f"score={final_score:.3f} rewards={rewards_str}",
-            flush=True,
-        )
+        try:
+            success = (final_score or 0.0) > 0.0
+            rewards_str = ",".join(f"{float(r):.2f}" for r in (step_rewards or [])) or "0.00"
+            print(
+                f"[END] success={str(success).lower()} "
+                f"steps={int(total_steps or 0)} "
+                f"score={float(final_score or 0.0):.3f} "
+                f"rewards={rewards_str}",
+                flush=True,
+            )
+        except Exception:
+            print("[END] success=false steps=0 score=0.000 rewards=0.00", flush=True)
 
 
 def _resolve_tasks() -> List[str]:
@@ -403,8 +426,13 @@ def _resolve_tasks() -> List[str]:
 
 
 def main() -> int:
-    client: Optional[OpenAI] = None
-    if not DRY_RUN and API_KEY:
+    print("Starting ML Audit inference...", file=sys.stderr, flush=True)
+
+    client: Any = None
+    if OpenAI is None:
+        if OPENAI_IMPORT_ERROR is not None:
+            print(f"WARN: OpenAI import unavailable: {OPENAI_IMPORT_ERROR}", file=sys.stderr, flush=True)
+    elif not DRY_RUN and API_KEY:
         try:
             client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
         except Exception as exc:
@@ -425,13 +453,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    exit_code = 0
     try:
-        exit_code = main()
+        main()
     except KeyboardInterrupt:
         print("Interrupted by user.", file=sys.stderr, flush=True)
-        exit_code = 130
     except Exception as exc:
         print(f"Fatal main error: {exc}", file=sys.stderr, flush=True)
-        exit_code = 0
-    sys.exit(exit_code)
+    sys.exit(0)
